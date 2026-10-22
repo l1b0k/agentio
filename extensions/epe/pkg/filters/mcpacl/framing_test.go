@@ -23,18 +23,7 @@ import (
 // array, or a second document after the first — hides tool names from the ACL
 // while remaining actionable by a lenient upstream parser.
 //
-// Such a body is decided by the policy's defaultAction, matching
-// traffix-extension. That is a deliberate compatibility choice with a known
-// consequence, pinned by the blacklist arms below: under defaultAction: allow, a
-// call this ACL is configured to deny is admitted when it is wrapped in an array
-// or hidden behind a second document, because the ACL never sees its tool name.
-// Whitelist policies (defaultAction: deny) remain protected.
-//
-// The bypass needs a lenient upstream to be more than a failed request: array
-// wrapping needs a server that still accepts 2025-03-26 batching, and a second
-// document needs one that reads several JSON documents from one body — behaviour
-// no MCP revision defines. Operators who cannot accept that exposure should run
-// a whitelist policy.
+// Inspection failures must deny under both allow and deny defaults.
 
 // blacklistPolicy denies exec_command and allows everything else, so a
 // passthrough bug is visible as ActionContinue rather than being masked by a
@@ -48,8 +37,7 @@ func blacklistPolicy() *Config {
 	}
 }
 
-// whitelistPolicy allows only read_file, so a framing violation that reaches
-// defaultAction is denied — the arm that must stay protected.
+// whitelistPolicy allows only read_file; inspection failures also deny.
 func whitelistPolicy() *Config {
 	return &Config{
 		DefaultAction: "deny",
@@ -59,7 +47,7 @@ func whitelistPolicy() *Config {
 	}
 }
 
-func TestFinalize_FramingViolation_FollowsDefaultAction(t *testing.T) {
+func TestFinalize_FramingViolation_FailsClosed(t *testing.T) {
 	tests := []struct {
 		name string
 		body []byte
@@ -85,9 +73,7 @@ func TestFinalize_FramingViolation_FollowsDefaultAction(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		// Both arms run the same body, so the only difference in outcome is
-		// defaultAction — which is exactly the contract being pinned.
-		t.Run(tc.name+"/blacklist admits it", func(t *testing.T) {
+		t.Run(tc.name+"/blacklist denies it", func(t *testing.T) {
 			p := newLegacyPlugin()
 			rctx := makeRctx("application/json")
 			rctx.RequestBody = tc.body
@@ -96,10 +82,8 @@ func TestFinalize_FramingViolation_FollowsDefaultAction(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			// The accepted exposure: exec_command is denied by rule, but the ACL
-			// cannot read its name out of this body, so defaultAction: allow wins.
-			if result.Action != legacyContinue {
-				t.Errorf("framing violation under defaultAction=allow must pass through, got %v", result.Action)
+			if result.Action != legacyImmediate {
+				t.Errorf("framing violation under defaultAction=allow must be denied, got %v", result.Action)
 			}
 		})
 
@@ -187,15 +171,9 @@ func TestFinalize_CompliantFraming_NotTreatedAsViolation(t *testing.T) {
 			want: legacyContinue,
 		},
 		{
-			// An unparseable body reaches statusUnreadable through the unmarshal
-			// failure rather than the framing check — framingViolation proves
-			// nothing about a body it cannot decode at all — and is then decided
-			// by defaultAction, which is allow in this table's policy.
-			// TestFinalize_FramingViolation_FollowsDefaultAction covers the
-			// whitelist arm, where the same body is denied.
-			name: "unparseable body follows defaultAction",
+			name: "unparseable body denied",
 			body: []byte(`not json at all`),
-			want: legacyContinue,
+			want: legacyImmediate,
 		},
 	}
 

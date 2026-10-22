@@ -12,12 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package mcpacl enforces MCP tool ACLs. For MCP 2026-07-28 it uses the
-// mandatory Mcp-Method and Mcp-Name headers for a fast path: non-governed
-// methods pass without body buffering, and a header-derived deny short-
-// circuits before the body arrives. An allow still needs the body to verify
-// header/body consistency. For older revisions the method is only knowable
-// from the JSON-RPC body, so the body is always requested.
+// Package mcpacl enforces MCP tool ACLs. Header-derived denials can short-
+// circuit, but every possible allow requires body inspection.
 package mcpacl
 
 import (
@@ -105,29 +101,6 @@ func denyReply(cfg Config) filter.Reply {
 	return filter.Reply{Status: status, Body: body}
 }
 
-// applyDefaultAction decides a request the ACL could not attribute to a tool by
-// the policy's defaultAction, honoured as an allow only when it is exactly
-// actionAllow. That is the same polarity the evaluate call site uses, so an
-// action value this build does not recognise denies rather than admits.
-//
-// Its callers are the cases where the ACL cannot name what the upstream would
-// execute: a batch or otherwise unreadable body, and a governed call with no
-// readable tool name. They route here rather than denying outright to keep the
-// verdict operators configure in defaultAction authoritative, matching
-// traffix-extension.
-//
-// The residual risk is deliberate and belongs in the release notes: under
-// defaultAction: allow, a body whose first JSON document is not the whole body
-// is admitted even though a lenient upstream may go on to execute a second,
-// uninspected tools/call. Whitelist policies (defaultAction: deny) are
-// unaffected.
-func applyDefaultAction(cfg Config) filter.Action {
-	if cfg.DefaultAction == actionAllow {
-		return filter.Continue()
-	}
-	return filter.Stop(denyReply(cfg))
-}
-
 // Filter evaluates one rule's MCP tool policy.
 type Filter struct {
 	filter.PassThrough
@@ -136,29 +109,18 @@ type Filter struct {
 
 func New(rule filter.RuleConfig[Config]) filter.Filter { return &Filter{rule: rule} }
 
-// OnRequestHeaders decides whether the body phase is needed. For MCP
-// 2026-07-28, the mandatory Mcp-Method and Mcp-Name headers enable a fast
-// path: non-governed methods pass through without body buffering, and a
-// header-derived deny short-circuits before the body arrives. An allow
-// still needs the body to verify header/body consistency (anti-smuggling).
-// For older revisions the method is only knowable from the JSON-RPC body.
+// OnRequestHeaders can deny governed calls early. Every other request needs
+// body inspection, including non-governed headers that could hide a tool call.
 func (f *Filter) OnRequestHeaders(ctx context.Context, st *filter.Stream) (filter.Action, error) {
 	version := st.Request.Headers[mcpProtocolVersionHeader]
 
-	// Fast path for MCP 2026-07-28: the spec makes Mcp-Method mandatory on
-	// every request and Mcp-Name mandatory on tools/call, enabling gateway-
-	// level decisions without buffering the JSON-RPC body.
+	// Routing headers can establish an early deny, but cannot establish an
+	// allow without inspecting what the upstream will execute.
 	if version == gaMCPVersion {
 		method := st.Request.Headers[mcpMethodHeader]
 		if method != "" {
-			// Non-governed method: pass through immediately — no body needed.
-			// The MCP 2026-07-28 spec requires servers to reject requests
-			// where Mcp-Method does not match the body's method, so a
-			// compliant server will not execute a tools/call hidden behind
-			// a tools/list header. Operators who cannot trust upstream
-			// compliance should use a whitelist policy (defaultAction: deny).
 			if !governedMethods[method] {
-				return filter.Continue(), nil
+				return filter.NeedBody(), nil
 			}
 			// Governed method (tools/call): evaluate from headers. A deny is
 			// safe to make immediately — deny is the safe-fail direction, and
@@ -197,18 +159,18 @@ func (f *Filter) OnRequestHeaders(ctx context.Context, st *filter.Stream) (filte
 func (f *Filter) OnRequestBody(ctx context.Context, st *filter.Stream, body filter.Body) (filter.Action, error) {
 	read := readBody(st.Request.Headers, body.Bytes)
 
-	// A body the ACL cannot read as one JSON-RPC message — a batch, trailing
-	// content after the first document, or an encoding this filter cannot undo —
-	// hides the tool name while staying actionable by a lenient upstream parser,
-	// so the policy's defaultAction decides (see applyDefaultAction). Evaluated
-	// before the version header so the outcome cannot be changed through it.
+	// Preserve the policy default for normalization and envelope type errors.
+	// Only JSON syntax and framing failures are unconditionally rejected.
+	if read.status == statusNormalizationFailed || read.status == statusUnattributed {
+		if f.rule.Cfg.DefaultAction == actionAllow {
+			return filter.Continue(), nil
+		}
+		return filter.Stop(denyReply(f.rule.Cfg)), nil
+	}
+
+	// Invalid JSON is independent of the business defaultAction.
 	if read.status == statusUnreadable {
-		rc := f.rule
-		log.FromContext(ctx).Info("MCP request body is not a readable single JSON-RPC message, applying defaultAction",
-			"rule", rc.ID.Name,
-			"defaultAction", rc.Cfg.DefaultAction,
-			"pod", st.Peer.Pod.String())
-		return applyDefaultAction(rc.Cfg), nil
+		return filter.Stop(denyReply(f.rule.Cfg)), nil
 	}
 
 	// Only tool invocations are governed; a body with no message at all, and
@@ -235,47 +197,15 @@ func (f *Filter) OnRequestBody(ctx context.Context, st *filter.Stream, body filt
 		return filter.Stop(denyReply(cfg)), nil
 	}
 
-	// For 2026-07-28, verify header/body consistency. We only reach the body
-	// phase when OnRequestHeaders returned NeedBody — i.e. the headers were
-	// absent or the header-based evaluation returned allow. If the mandatory
-	// headers are present and match the body, the allow is confirmed without
-	// re-evaluating. If they mismatch, fall back to body-based evaluation
-	// (the body is the source of truth for what upstream will execute).
-	if version == gaMCPVersion {
-		hMethod := st.Request.Headers[mcpMethodHeader]
-		hName := st.Request.Headers[mcpNameHeader]
-		if hName != "" {
-			// Decode Base64 sentinel encoding before comparing to the body.
-			// If decoding fails, hName stays raw and won't match the body's
-			// tool name — triggering a mismatch fallback to body evaluation.
-			if decoded, ok := decodeMcpHeaderValue(hName); ok {
-				hName = decoded
-			}
-		}
-		if hMethod != "" && hName != "" && hMethod == method && read.hasTool && hName == toolName {
-			// Headers fully match the body. OnRequestHeaders only let us
-			// through when the header-based evaluation was an allow, so the
-			// allow is confirmed.
+	// The body is authoritative even when routing headers disagree. Always
+	// evaluate it rather than treating matching headers as a cached allow.
+	if !read.hasTool {
+		// Leave parameter validation to the upstream server, preserving the
+		// existing policy default when no tool name can be attributed.
+		if cfg.DefaultAction == actionAllow {
 			return filter.Continue(), nil
 		}
-		if hMethod != "" || hName != "" {
-			log.FromContext(ctx).Info("MCP header/body mismatch, falling back to body evaluation",
-				"rule", rc.ID.Name,
-				"headerMethod", hMethod, "bodyMethod", method,
-				"headerTool", hName, "bodyTool", toolName,
-				"pod", st.Peer.Pod.String())
-		}
-		// Fall through to body-based evaluation.
-	}
-
-	// A governed call whose tool name is absent or not a string cannot be
-	// attributed to a tool-scoped rule, so the policy's defaultAction decides —
-	// the same fallback evaluate reaches when no rule matches a named tool.
-	if !read.hasTool {
-		log.FromContext(ctx).Info("MCP tool call without a readable tool name, applying defaultAction",
-			"rule", rc.ID.Name, "method", method,
-			"defaultAction", cfg.DefaultAction, "pod", st.Peer.Pod.String())
-		return applyDefaultAction(cfg), nil
+		return filter.Stop(denyReply(cfg)), nil
 	}
 
 	if decision := evaluate(cfg, method, toolName); decision != actionAllow {

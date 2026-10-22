@@ -205,7 +205,7 @@ func TestEvaluateEmptyDefaultActionDenies(t *testing.T) {
 }
 
 // TestFastPath covers the OnRequestHeaders fast-path for MCP 2026-07-28:
-// non-governed methods pass without body buffering, denied tools/call
+// non-governed methods request body inspection, denied tools/call
 // short-circuits with Stop, and allowed tools/call still requests the body
 // for header/body verification.
 func TestFastPath(t *testing.T) {
@@ -217,10 +217,10 @@ func TestFastPath(t *testing.T) {
 		cfg      Config
 		want     filter.ActionKind
 	}{
-		// Non-governed methods: fast Continue, no body buffering.
-		{"non-governed tools/list", gaMCPVersion, "tools/list", "", whitelistCfg(), filter.KindContinue},
-		{"non-governed ping", gaMCPVersion, "ping", "", whitelistCfg(), filter.KindContinue},
-		{"non-governed server/discover", gaMCPVersion, "server/discover", "", whitelistCfg(), filter.KindContinue},
+		// Non-governed headers still need body inspection.
+		{"non-governed tools/list", gaMCPVersion, "tools/list", "", whitelistCfg(), filter.KindNeedBody},
+		{"non-governed ping", gaMCPVersion, "ping", "", whitelistCfg(), filter.KindNeedBody},
+		{"non-governed server/discover", gaMCPVersion, "server/discover", "", whitelistCfg(), filter.KindNeedBody},
 
 		// Governed method, denied tool: fast Stop from headers.
 		{"whitelist denies unlisted tool from headers", gaMCPVersion, "tools/call", "evil", whitelistCfg(), filter.KindStop},
@@ -406,4 +406,42 @@ func TestOnRequestBody_PartialGAHeaders(t *testing.T) {
 			t.Errorf("Kind = %v, want KindContinue (body-derived allow with partial headers)", act.Kind())
 		}
 	})
+}
+
+func TestFilter_HeaderBodyDecisionsBothDefaults(t *testing.T) {
+	for _, def := range []string{"allow", "deny"} {
+		cfg := whitelistCfg()
+		cfg.DefaultAction = def
+		tests := []struct {
+			name, method, tool, body string
+			want                     filter.ActionKind
+		}{
+			{"hidden denied tool", "tools/list", "", `{"method":"tools/call","params":{"name":"evil"}}`, filter.KindStop},
+			{"hidden allowed tool", "ping", "", allowedCall, filter.KindContinue},
+			{"tool conflict", "tools/call", "allowed-tool", `{"method":"tools/call","params":{"name":"evil"}}`, filter.KindStop},
+			{"matching allowed", "tools/call", "allowed-tool", allowedCall, filter.KindContinue},
+			{"lifecycle", "initialize", "", `{"method":"initialize"}`, filter.KindContinue},
+			{"notification", "notifications/initialized", "", `{"method":"notifications/initialized"}`, filter.KindContinue},
+			{"unmatched tool", "tools/list", "", `{"method":"tools/call","params":{"name":"other"}}`, filter.KindStop},
+		}
+		for _, tc := range tests {
+			t.Run(def+"/"+tc.name, func(t *testing.T) {
+				local := cfg
+				local.Rules = append(append([]RuleEntry{}, cfg.Rules...), RuleEntry{Method: "tools/call", ToolNames: []string{"evil"}, Action: "deny"})
+				want := tc.want
+				if tc.name == "unmatched tool" && def == "allow" {
+					want = filter.KindContinue
+				}
+				st := streamWithHeaders(gaMCPVersion, tc.method, tc.tool)
+				act := runHeaders(t, local, st)
+				if act.Kind() != filter.KindNeedBody {
+					t.Fatalf("header kind = %v, want NeedBody", act.Kind())
+				}
+				act = runBody(t, local, st, tc.body)
+				if act.Kind() != want {
+					t.Fatalf("body kind = %v, want %v", act.Kind(), want)
+				}
+			})
+		}
+	}
 }

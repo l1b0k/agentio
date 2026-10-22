@@ -53,9 +53,8 @@ func utf16leBytes(s string, bom bool) []byte {
 	return out
 }
 
-// blacklistCfg allows by default and denies one named tool. This is the posture
-// that makes an unreadable tool name dangerous: falling through to
-// defaultAction admits the call.
+// blacklistCfg allows unmatched named tools and denies one named tool.
+// Inspection failures must deny even with this permissive business default.
 func blacklistCfg() Config {
 	return Config{
 		DefaultAction: "allow",
@@ -153,14 +152,10 @@ func TestOnRequestBody(t *testing.T) {
 			want: filter.KindStop,
 		},
 		{
-			// A BOM must likewise not hide a batch array from the framing
-			// check: the BOM is stripped first, so the batch is still detected.
-			// The detected violation is then decided by defaultAction, which is
-			// allow in this arm.
-			name: "BOM-prefixed batch follows defaultAction",
+			name: "BOM-prefixed batch is denied",
 			cfg:  blacklistCfg(),
 			body: func(*testing.T) []byte { return append([]byte{0xEF, 0xBB, 0xBF}, "["+deniedCall+"]"...) },
-			want: filter.KindContinue,
+			want: filter.KindStop,
 		},
 		{
 			// UTF-16 with a BOM is auto-detected by Jackson byte-based stacks,
@@ -171,10 +166,6 @@ func TestOnRequestBody(t *testing.T) {
 			want: filter.KindStop,
 		},
 		{
-			// A governed call whose params.name is absent cannot be attributed
-			// to a tool rule, so defaultAction decides. The accepted
-			// consequence on this arm: omitting the name evades every
-			// tool-scoped rule under a blacklist. whitelistCfg denies it.
 			name: "governed call with absent tool name follows defaultAction",
 			cfg:  blacklistCfg(),
 			body: func(*testing.T) []byte { return []byte(`{"jsonrpc":"2.0","method":"tools/call","params":{}}`) },
@@ -201,16 +192,7 @@ func TestOnRequestBody(t *testing.T) {
 			want: filter.KindContinue,
 		},
 		{
-			// Each declared coding is another decompression pass over up to
-			// 8MiB, and the list is client-supplied, so a long chain is still
-			// refused outright rather than executed: four nested gzip layers of
-			// 1MiB of zeros is ~115 bytes on the wire but expands to 1MiB, and
-			// nothing bounds how many layers a client may claim. That refusal —
-			// the decompression bomb guard — is unchanged; what defaultAction
-			// decides is only the verdict on the request whose body was refused,
-			// so under a blacklist it is forwarded still compressed and the
-			// upstream decides what to do with it.
-			name:    "long coding chain is refused, verdict follows defaultAction",
+			name:    "long coding chain preserves defaultAction",
 			cfg:     blacklistCfg(),
 			headers: map[string]string{"content-encoding": "gzip, gzip, gzip, gzip"},
 			body:    func(t *testing.T) []byte { return nestedGzip(t, make([]byte, 1<<20), 4) },
@@ -332,5 +314,126 @@ func TestParse_NormalizesUnsupportedVersionAction(t *testing.T) {
 	act := runRawBody(t, cfg, map[string]string{mcpProtocolVersionHeader: "1999-01-01"}, []byte(deniedCall))
 	if act.Kind() != filter.KindContinue {
 		t.Errorf("unsupportedVersionAction %q was not honoured as passthrough", "Passthrough")
+	}
+}
+
+// Inspection failure must not inherit the business default for unmatched tools.
+func TestOnRequestBody_InspectionFailuresBothDefaults(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     []byte
+		encoding string
+	}{
+		{"malformed", []byte(`{"method":`), ""},
+		{"batch", []byte("[" + allowedCall + "]"), ""},
+		{"multiple documents", []byte(allowedCall + deniedCall), ""},
+	}
+	for _, def := range []string{"allow", "deny"} {
+		cfg := whitelistCfg()
+		cfg.DefaultAction = def
+		for _, tc := range tests {
+			t.Run(def+"/"+tc.name, func(t *testing.T) {
+				act := runRawBody(t, cfg, map[string]string{contentEncodingHeader: tc.encoding}, tc.body)
+				if act.Kind() != filter.KindStop {
+					t.Fatalf("kind = %v, want Stop", act.Kind())
+				}
+				reply, _ := act.Reply()
+				if reply.Status != int(cfg.DenyStatus) || string(reply.Body) != cfg.DenyBody {
+					t.Fatalf("wrong deny reply: %+v", reply)
+				}
+			})
+		}
+	}
+}
+
+// Size and encoding policy are intentionally unchanged by the JSON fix.
+func TestOnRequestBody_SizeAndEncodingCompatibility(t *testing.T) {
+	oversized := []byte(`{"method":"tools/call","params":{"name":"allowed-tool","arguments":{"text":"` + string(bytes.Repeat([]byte("x"), maxDecodedBodyBytes)) + `"}}}`)
+	for _, def := range []string{"allow", "deny"} {
+		cfg := whitelistCfg()
+		cfg.DefaultAction = def
+		for _, tc := range []struct {
+			name                 string
+			body                 []byte
+			encoding             string
+			normalizationFailure bool
+		}{
+			{"large raw valid JSON", oversized, "", false},
+			{"large identity valid JSON", oversized, "identity", false},
+			{"decompression limit", gzipped(t, string(oversized)), "gzip", true},
+			{"unknown encoding", []byte(allowedCall), "br", true},
+		} {
+			t.Run(def+"/"+tc.name, func(t *testing.T) {
+				want := filter.KindContinue
+				if tc.normalizationFailure && def == "deny" {
+					want = filter.KindStop
+				}
+				act := runRawBody(t, cfg, map[string]string{contentEncodingHeader: tc.encoding}, tc.body)
+				if act.Kind() != want {
+					t.Fatalf("kind=%v, want %v", act.Kind(), want)
+				}
+			})
+		}
+	}
+}
+
+// Parameter validation belongs to the upstream, not the ACL framing check.
+func TestOnRequestBody_ToolNameCompatibility(t *testing.T) {
+	for _, def := range []string{"allow", "deny"} {
+		cfg := whitelistCfg()
+		cfg.DefaultAction = def
+		for _, body := range []string{
+			`{"method":"tools/call"}`,
+			`{"method":"tools/call","params":{}}`,
+			`{"method":"tools/call","params":[]}`,
+			`{"method":"tools/call","params":123}`,
+			`{"method":"tools/call","params":"invalid"}`,
+			`{"method":"tools/call","params":null}`,
+			`{"method":"tools/call","params":{"name":null}}`,
+			`{"method":"tools/call","params":{"name":123}}`,
+			`{"method":"tools/call","params":{"name":""}}`,
+		} {
+			t.Run(def+"/"+body, func(t *testing.T) {
+				want := filter.KindStop
+				if def == "allow" {
+					want = filter.KindContinue
+				}
+				act := runRawBody(t, cfg, nil, []byte(body))
+				if act.Kind() != want {
+					t.Fatalf("kind=%v, want %v", act.Kind(), want)
+				}
+			})
+		}
+	}
+}
+
+func TestOnRequestBody_ParameterTypesDoNotBecomeFramingErrors(t *testing.T) {
+	for _, def := range []string{"allow", "deny"} {
+		cfg := whitelistCfg()
+		cfg.DefaultAction = def
+		tests := []struct {
+			body     string
+			fallback bool
+		}{
+			{`{"method":"ping","params":[]}`, false},
+			{`{"method":"initialize","params":123}`, false},
+			{`{"method":"tools/list","params":"invalid"}`, false},
+			{`{"method":"notifications/initialized","params":{"name":123}}`, false},
+			{`{"method":123,"params":{}}`, true},
+			{`{"method":[],"params":{}}`, true},
+			{`{"method":"tools/call","params":{"name":"allowed-tool","arguments":123}}`, false},
+		}
+		for _, tc := range tests {
+			t.Run(def+"/"+tc.body, func(t *testing.T) {
+				want := filter.KindContinue
+				if tc.fallback && def == "deny" {
+					want = filter.KindStop
+				}
+				act := runRawBody(t, cfg, nil, []byte(tc.body))
+				if act.Kind() != want {
+					t.Fatalf("kind=%v, want %v", act.Kind(), want)
+				}
+			})
+		}
 	}
 }

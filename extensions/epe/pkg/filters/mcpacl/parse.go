@@ -194,12 +194,8 @@ func skipToken(dec *json.Decoder) {
 }
 
 type jsonrpcRequest struct {
-	Method string `json:"method"`
-	Params struct {
-		// Name stays raw so a non-string value is a missing tool name rather
-		// than an unmarshal error that would also swallow the method.
-		Name json.RawMessage `json:"name"`
-	} `json:"params"`
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
 }
 
 // bodyStatus classifies what the ACL can do with a request body.
@@ -211,9 +207,15 @@ const (
 	statusAbsent bodyStatus = iota
 	// statusUnreadable means bytes are present but no single JSON-RPC message
 	// can be read out of them — a batch, trailing content after the first
-	// document, invalid JSON, or an encoding this filter cannot undo. No
-	// verdict can be reached, so the caller denies.
+	// document, or invalid JSON. The caller denies these framing failures.
 	statusUnreadable
+	// statusNormalizationFailed preserves the existing policy fallback for
+	// content coding, decompression limits, and text decoding failures.
+	statusNormalizationFailed
+	// statusUnattributed means valid JSON whose envelope fields cannot be
+	// attributed to a method. Leave schema validation to upstream and use
+	// the existing policy default.
+	statusUnattributed
 	// statusMessage means exactly one JSON-RPC message was read.
 	statusMessage
 )
@@ -230,18 +232,16 @@ type bodyRead struct {
 
 // readBody normalizes body and reads the single JSON-RPC message it carries.
 //
-// Anything that leaves the ACL unable to name what the upstream would execute
-// is statusUnreadable rather than a pass: a body that this filter cannot parse
-// but a lenient upstream can is exactly how a tool call gets hidden from the
-// policy. Compressed and BOM-marked bodies are therefore decoded first (see
-// normalizeBody) so that only genuinely unjudgeable bodies are denied.
+// Invalid JSON and framing violations are statusUnreadable and denied.
+// Content/text decoding failures are reported separately so the existing
+// normalization policy, including decompression limits, remains unchanged.
 func readBody(headers map[string]string, raw []byte) bodyRead {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return bodyRead{status: statusAbsent}
 	}
 	body, ok := normalizeBody(headers, raw)
 	if !ok {
-		return bodyRead{status: statusUnreadable}
+		return bodyRead{status: statusNormalizationFailed}
 	}
 	if len(bytes.TrimSpace(body)) == 0 {
 		return bodyRead{status: statusAbsent}
@@ -249,25 +249,32 @@ func readBody(headers map[string]string, raw []byte) bodyRead {
 	// A top-level array is JSON-RPC batching, removed in MCP 2025-06-18. It is
 	// checked explicitly because it is valid JSON that a batching-capable
 	// upstream executes while hiding every tool name in it from this ACL, and
-	// because that exposure is documented against defaultAction.
+	// because batches cannot be attributed to a single tool.
 	if isBatchBody(body) {
 		return bodyRead{status: statusUnreadable}
 	}
-	var req jsonrpcRequest
-	// Unmarshal is also the framing check for everything else the revision
-	// forbids: it rejects a second document, and any non-whitespace trailing
-	// content, after the first ("invalid character ... after top-level value"),
-	// accepting only insignificant whitespace. That rejection is what makes the
-	// tool name returned below the tool name the upstream would execute.
-	//
-	// Do NOT replace this with a json.Decoder. Decoder.Decode stops at the end
-	// of the first value and reports nothing about what follows, which would let
-	// a smuggled second tools/call through unseen.
-	if err := json.Unmarshal(body, &req); err != nil {
+	// Validate syntax and the entire document independently of field types.
+	// A Decoder.Decode call alone would accept an uninspected second document.
+	if !json.Valid(body) {
 		return bodyRead{status: statusUnreadable}
 	}
+	var req jsonrpcRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		return bodyRead{status: statusUnattributed}
+	}
 	out := bodyRead{status: statusMessage, method: req.Method}
-	if err := json.Unmarshal(req.Params.Name, &out.tool); err == nil && out.tool != "" {
+	if !governedMethods[req.Method] {
+		return out
+	}
+	// Parameter shape is an upstream concern. A wrong type must not hide an
+	// otherwise identifiable non-governed method or become a framing error.
+	var params struct {
+		Name json.RawMessage `json:"name"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return out
+	}
+	if err := json.Unmarshal(params.Name, &out.tool); err == nil && out.tool != "" {
 		out.hasTool = true
 	}
 	return out
